@@ -1,0 +1,12 @@
+{
+  "name": "agycmdr",
+  "version": "1.0.0",
+  "description": "Antigravity Commander — Unified CLI session manager, full-text transcript search engine, live process inspector, and workspace restorer for Google Antigravity CLI (agy).",
+  "author": {
+    "name": "Matthew (layolayo)",
+    "url": "https://github.com/layolayo"
+  },
+  "homepage": "https://github.com/layolayo/agycmdr",
+  "repository": "https://github.com/layolayo/agycmdr",
+  "license": "MIT"
+}

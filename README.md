@@ -26,6 +26,12 @@ Works seamlessly across **Hyprland (Omarchy)** and **GNOME / standard Linux desk
 
 ## Installation
 
+### 1. Install as an Antigravity CLI Plugin + Skill
+```bash
+agy plugin install https://github.com/layolayo/agycmdr
+```
+
+### 2. Install CLI Commands & Auto-Save Timer (`~/.local/bin`)
 ```bash
 git clone https://github.com/layolayo/agycmdr.git
 cd agycmdr
