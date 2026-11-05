@@ -1,0 +1,1210 @@
+#!/usr/bin/env python3
+"""
+agycmdr: Antigravity Commander — Unified session search, live process inspector,
+workspace snapshotter, and session restorer for Google Antigravity CLI (agy).
+
+Works seamlessly across Hyprland (Omarchy) and GNOME/standard Linux desktops (Ubuntu, etc.).
+Zero external Python dependencies (uses Python standard library + optional ripgrep speedup).
+
+Can be invoked as:
+  - agycmdr [list | search | save | restore | auto-save]
+  - agy-search [query]
+  - agy-restore [--save | --list]
+  - restore-agy-workspaces [--save | --list]
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "1.0.0"
+
+# ANSI colour codes
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+MAGENTA = "\033[35m"
+RED = "\033[31m"
+BG_YELLOW = "\033[43;30m"
+
+UUID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.IGNORECASE)
+USER_REQ_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
+
+
+def get_config_file() -> Path:
+    config_root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    config_dir = config_root / "agy"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir / "workspaces.json"
+
+
+def get_gemini_root() -> Path:
+    return Path.home() / ".gemini"
+
+
+def parse_iso_timestamp(raw: str) -> tuple[str, float]:
+    """Parse an ISO/SQLite timestamp into local 'YYYY-MM-DD HH:MM' and epoch seconds."""
+    if not raw:
+        return "", 0.0
+    cleaned = raw.strip()
+    cleaned = re.sub(r"\.(\d{6})\d+", r".\1", cleaned)
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        dt = datetime.datetime.fromisoformat(cleaned)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M"), dt.timestamp()
+    except Exception:
+        return raw[:16], 0.0
+
+
+def clean_user_content(text: str) -> str:
+    """Extract clean user prompt text from <USER_REQUEST> tags if present."""
+    m = USER_REQ_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    text = re.sub(r"<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<USER_SETTINGS_CHANGE>.*?</USER_SETTINGS_CHANGE>", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
+def load_metadata(gemini_root: Path) -> dict[str, dict]:
+    """Load conversation titles, dates, and workspace paths from SQLite and annotations."""
+    meta: dict[str, dict] = {}
+
+    db_path = gemini_root / "antigravity-cli" / "conversation_summaries.db"
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT conversation_id, title, preview, last_modified_time, workspace_uris, parent_conversation_id "
+                "FROM conversation_summaries"
+            )
+            for cid, title, preview, last_mod, ws_uris, parent_id in cur.fetchall():
+                cwd = str(Path.home())
+                if ws_uris:
+                    try:
+                        uris = json.loads(ws_uris)
+                        if uris and isinstance(uris, list) and uris[0].startswith("file://"):
+                            cwd = uris[0][len("file://") :]
+                    except Exception:
+                        pass
+                dt_str, ts = parse_iso_timestamp(last_mod)
+                meta[cid] = {
+                    "title": (title or "").strip(),
+                    "preview": (preview or "").strip(),
+                    "date_str": dt_str,
+                    "timestamp": ts,
+                    "cwd": cwd,
+                    "parent_id": parent_id or "",
+                }
+            conn.close()
+        except Exception:
+            pass
+
+    ann_dir = gemini_root / "antigravity-cli" / "annotations"
+    if ann_dir.is_dir():
+        for pbtxt in ann_dir.glob("*.pbtxt"):
+            cid = pbtxt.stem
+            try:
+                text = pbtxt.read_text(encoding="utf-8", errors="replace")
+                m = re.search(r'title:\s*"([^"]+)"', text)
+                if m:
+                    entry = meta.setdefault(
+                        cid,
+                        {
+                            "title": "",
+                            "preview": "",
+                            "date_str": "",
+                            "timestamp": 0.0,
+                            "cwd": str(Path.home()),
+                            "parent_id": "",
+                        },
+                    )
+                    if not entry["title"]:
+                        entry["title"] = m.group(1).strip()
+            except Exception:
+                pass
+
+    return meta
+
+
+def is_hyprland_active() -> bool:
+    """Return True if running inside an active Hyprland session with hyprctl available."""
+    return bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl"))
+
+
+def detect_terminal_emulator() -> tuple[str, str]:
+    """
+    Detect the preferred terminal emulator binary and its launch style.
+    Returns (binary_path, style_name).
+    """
+    env_term = os.environ.get("TERMINAL", "").strip()
+    candidates = []
+    if env_term:
+        candidates.append(env_term)
+    if is_hyprland_active():
+        candidates.extend(["ghostty", "alacritty", "kitty", "foot", "wezterm", "gnome-terminal", "ptyxis"])
+    else:
+        candidates.extend(["gnome-terminal", "ghostty", "ptyxis", "kitty", "alacritty", "wezterm", "foot"])
+
+    for cand in candidates:
+        path = shutil.which(cand)
+        if path:
+            base = os.path.basename(path)
+            return path, base
+    return "xterm", "xterm"
+
+
+def spawn_terminal_with_agy(
+    conv_id: str,
+    cwd: str,
+    title: str = "",
+    workspace: str | None = None,
+    skip_perms: bool = True,
+) -> None:
+    """Spawn a new terminal window running agy for the given conversation ID."""
+    target_cwd = cwd if (cwd and os.path.isdir(cwd)) else str(Path.home())
+    agy_bin = shutil.which("agy") or str(Path.home() / ".local" / "bin" / "agy")
+    agy_args = [agy_bin]
+    if skip_perms:
+        agy_args.append("--dangerously-skip-permissions")
+    agy_args.extend(["--conversation", conv_id])
+
+    win_title = f"agy: {title}" if title else f"agy: {conv_id[:8]}"
+    term_bin, term_style = detect_terminal_emulator()
+
+    # Hyprland workspace placement if requested and active
+    if workspace and is_hyprland_active():
+        if term_style == "ghostty":
+            term_cmd = (
+                f"{term_bin} --gtk-single-instance=true --class=org.omarchy.agent "
+                f"--working-directory={target_cwd} -e {' '.join(agy_args)}"
+            )
+        elif term_style == "alacritty":
+            term_cmd = f"{term_bin} --working-directory {target_cwd} --title '{win_title}' -e {' '.join(agy_args)}"
+        elif term_style == "kitty":
+            term_cmd = f"{term_bin} --directory {target_cwd} --title '{win_title}' {' '.join(agy_args)}"
+        else:
+            term_cmd = f"{term_bin} -e {' '.join(agy_args)}"
+
+        # Support both Omarchy 4 Lua dispatcher and standard Hyprland dispatch
+        lua_cmd = f"hl.dsp.exec_cmd([[[workspace {workspace} silent] {term_cmd}]])"
+        res = subprocess.run(
+            ["hyprctl", "dispatch", lua_cmd],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0 or "Invalid dispatcher" in (res.stdout + res.stderr):
+            std_cmd = f"[workspace {workspace} silent] {term_cmd}"
+            subprocess.run(
+                ["hyprctl", "dispatch", "exec", std_cmd],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        return
+
+    # Standard desktop launch (GNOME, etc.)
+    if term_style == "gnome-terminal":
+        cmd = [
+            term_bin,
+            f"--working-directory={target_cwd}",
+            f"--title={win_title}",
+            "--",
+            "bash",
+            "-ic",
+            " ".join(agy_args),
+        ]
+    elif term_style == "ghostty":
+        cmd = [
+            term_bin,
+            "--gtk-single-instance=true",
+            "--class=org.omarchy.agent",
+            f"--working-directory={target_cwd}",
+            "-e",
+            *agy_args,
+        ]
+    elif term_style == "kitty":
+        cmd = [term_bin, "--directory", target_cwd, "--title", win_title, *agy_args]
+    elif term_style == "alacritty":
+        cmd = [term_bin, "--working-directory", target_cwd, "--title", win_title, "-e", *agy_args]
+    elif term_style == "ptyxis":
+        cmd = [term_bin, "--working-directory", target_cwd, "--", *agy_args]
+    else:
+        cmd = [term_bin, "-e", *agy_args]
+
+    subprocess.Popen(cmd, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def launch_agy_session(conv_id: str, cwd: str, title: str = "", new_window: bool = False, skip_perms: bool = True):
+    """Reopen the selected conversation in agy (either inline or in a new terminal window)."""
+    target_cwd = cwd if (cwd and os.path.isdir(cwd)) else str(Path.home())
+    if new_window:
+        _, term_style = detect_terminal_emulator()
+        print(
+            f"\n{GREEN}→ Launching new {term_style} window for conversation "
+            f"{BOLD}{conv_id}{RESET} in {CYAN}{target_cwd}{RESET}..."
+        )
+        spawn_terminal_with_agy(conv_id=conv_id, cwd=target_cwd, title=title, skip_perms=skip_perms)
+        return
+
+    agy_bin = shutil.which("agy") or str(Path.home() / ".local" / "bin" / "agy")
+    agy_cmd = [agy_bin]
+    if skip_perms:
+        agy_cmd.append("--dangerously-skip-permissions")
+    agy_cmd.extend(["--conversation", conv_id])
+
+    print(f"\n{GREEN}→ Resuming conversation {BOLD}{conv_id}{RESET} in {CYAN}{target_cwd}{RESET}...\n")
+    try:
+        os.chdir(target_cwd)
+    except Exception:
+        pass
+    os.execvp(agy_bin, agy_cmd)
+
+
+# =====================================================================
+# LIVE PROCESS & WORKSPACE DETECTION
+# =====================================================================
+
+def scan_active_agy_sessions(meta: dict[str, dict] | None = None) -> list[dict]:
+    """
+    Scan /proc for active agy processes and their open presence/<uuid>.lock files.
+    If Hyprland is active, also map each process to its Hyprland workspace.
+    """
+    if meta is None:
+        meta = load_metadata(get_gemini_root())
+
+    pid_to_clients: dict[int, list[dict]] = {}
+    if is_hyprland_active():
+        try:
+            clients = json.loads(subprocess.check_output(["hyprctl", "clients", "-j"]).decode())
+            for c in clients:
+                ws = c.get("workspace", {}).get("name")
+                pid = c.get("pid")
+                if ws and pid:
+                    pid_to_clients.setdefault(int(pid), []).append(
+                        {
+                            "ws": str(ws),
+                            "title": (c.get("title") or "").strip(),
+                            "class": (c.get("class") or "").strip(),
+                            "address": c.get("address"),
+                            "used": False,
+                        }
+                    )
+        except Exception:
+            pass
+
+    try:
+        pids = [int(p) for p in subprocess.check_output(["pgrep", "-x", "agy"]).decode().splitlines()]
+    except Exception:
+        pids = []
+
+    records: list[dict] = []
+    for pid in pids:
+        conv_id = None
+        try:
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                try:
+                    target = os.readlink(f"/proc/{pid}/fd/{fd}")
+                    if "presence/" in target and target.endswith(".lock"):
+                        conv_id = os.path.basename(target).replace(".lock", "")
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+        if not conv_id:
+            continue
+
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_text(errors="replace").replace("\0", " ").strip()
+        except Exception:
+            cmdline = ""
+
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except Exception:
+            cwd = str(Path.home())
+
+        win_pid = None
+        if pid_to_clients:
+            curr = pid
+            while curr and curr > 1:
+                if curr in pid_to_clients:
+                    win_pid = curr
+                    break
+                try:
+                    status_text = Path(f"/proc/{curr}/status").read_text(errors="replace")
+                    for line in status_text.splitlines():
+                        if line.startswith("PPid:"):
+                            curr = int(line.split()[1])
+                            break
+                    else:
+                        break
+                except Exception:
+                    break
+
+        info = meta.get(conv_id, {})
+        records.append(
+            {
+                "pid": pid,
+                "conversation_id": conv_id,
+                "cwd": cwd,
+                "title": info.get("title", ""),
+                "date_str": info.get("date_str", ""),
+                "cmdline": cmdline,
+                "win_pid": win_pid,
+                "ws": None,
+            }
+        )
+
+    if pid_to_clients:
+        # Pass 1: Match exact window titles or single-window PIDs first
+        for rec in records:
+            win_pid = rec["win_pid"]
+            if not win_pid:
+                continue
+            candidates = pid_to_clients.get(win_pid, [])
+            if len(candidates) == 1:
+                candidates[0]["used"] = True
+                rec["ws"] = candidates[0]["ws"]
+            else:
+                for c in candidates:
+                    if not c["used"] and c["title"] == rec["cmdline"]:
+                        c["used"] = True
+                        rec["ws"] = c["ws"]
+                        break
+
+        # Pass 2: Match remaining multi-window PIDs
+        for rec in records:
+            if rec["ws"] or not rec["win_pid"]:
+                continue
+            candidates = pid_to_clients.get(rec["win_pid"], [])
+            chosen = None
+            for c in candidates:
+                if not c["used"] and "agy" in c["title"].lower():
+                    chosen = c
+                    break
+            if not chosen:
+                for c in candidates:
+                    if not c["used"]:
+                        chosen = c
+                        break
+            if not chosen and candidates:
+                chosen = candidates[-1]
+            if chosen:
+                chosen["used"] = True
+                rec["ws"] = chosen["ws"]
+
+    # Deduplicate by conversation_id
+    deduped: list[dict] = []
+    seen = set()
+    for rec in records:
+        cid = rec["conversation_id"]
+        if cid in seen:
+            continue
+        seen.add(cid)
+        if not rec["ws"]:
+            rec["ws"] = "1"
+        deduped.append(rec)
+
+    return deduped
+
+
+def ws_sort_key(w: str) -> tuple[int, int | str]:
+    return (0, int(w)) if str(w).isdigit() else (1, str(w))
+
+
+def cmd_save() -> int:
+    """Snapshot currently active agy sessions into ~/.config/agy/workspaces.json."""
+    config_file = get_config_file()
+    meta = load_metadata(get_gemini_root())
+    active = scan_active_agy_sessions(meta)
+
+    if not active:
+        print(f"{YELLOW}No active agy sessions found to snapshot.{RESET}")
+        return 0
+
+    grouped: dict[str, list[dict]] = {}
+    for rec in active:
+        ws = str(rec.get("ws") or "1")
+        entry = {
+            "conversation_id": rec["conversation_id"],
+            "cwd": rec["cwd"],
+        }
+        if rec.get("title"):
+            entry["title"] = rec["title"]
+        grouped.setdefault(ws, []).append(entry)
+
+    serialised = {}
+    for w in sorted(grouped.keys(), key=ws_sort_key):
+        items = grouped[w]
+        serialised[w] = items[0] if len(items) == 1 else items
+
+    config_file.write_text(json.dumps(serialised, indent=2) + "\n", encoding="utf-8")
+
+    print(
+        f"{GREEN}Successfully saved {BOLD}{len(active)}{RESET}{GREEN} active agy session(s) "
+        f"to {CYAN}{config_file}{RESET}:"
+    )
+    for w in sorted(grouped.keys(), key=ws_sort_key):
+        for item in grouped[w]:
+            title_suffix = f' — "{BOLD}{item["title"]}{RESET}"' if item.get("title") else ""
+            cwd_short = item["cwd"].replace(str(Path.home()), "~")
+            print(f"  Workspace {YELLOW}{w}{RESET} → {CYAN}{item['conversation_id']}{RESET} ({cwd_short}){title_suffix}")
+    return 0
+
+
+def load_saved_sessions(meta: dict[str, dict] | None = None) -> list[dict]:
+    """Load saved sessions from ~/.config/agy/workspaces.json."""
+    config_file = get_config_file()
+    if not config_file.exists():
+        return []
+    if meta is None:
+        meta = load_metadata(get_gemini_root())
+
+    try:
+        data = json.loads(config_file.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    saved: list[dict] = []
+    for ws in sorted(data.keys(), key=ws_sort_key):
+        entries = data[ws]
+        if isinstance(entries, dict):
+            entries = [entries]
+        for entry in entries:
+            cid = entry.get("conversation_id")
+            if not cid:
+                continue
+            info = meta.get(cid, {})
+            saved.append(
+                {
+                    "ws": str(ws),
+                    "conversation_id": cid,
+                    "cwd": entry.get("cwd") or info.get("cwd") or str(Path.home()),
+                    "title": entry.get("title") or info.get("title") or "",
+                    "date_str": info.get("date_str") or "",
+                }
+            )
+    return saved
+
+
+def cmd_restore() -> int:
+    """Restore saved agy sessions from ~/.config/agy/workspaces.json."""
+    config_file = get_config_file()
+    if not config_file.exists():
+        print(f"{YELLOW}No saved sessions found at {config_file}. Run 'agycmdr save' first.{RESET}")
+        return 1
+
+    meta = load_metadata(get_gemini_root())
+    saved = load_saved_sessions(meta)
+    active_ids = {r["conversation_id"] for r in scan_active_agy_sessions(meta)}
+
+    if not saved:
+        print(f"{YELLOW}No saved sessions found in {config_file}.{RESET}")
+        return 0
+
+    launched = 0
+    skipped = 0
+    workspaces_used = []
+
+    for item in saved:
+        cid = item["conversation_id"]
+        ws = item["ws"]
+        cwd = item["cwd"]
+        title = item["title"]
+        title_str = f' ("{title}")' if title else ""
+        if ws not in workspaces_used:
+            workspaces_used.append(ws)
+
+        if cid in active_ids:
+            print(f"{DIM}↷ Skipping session {cid}{title_str} on workspace {ws} (already running){RESET}")
+            skipped += 1
+            continue
+
+        print(f"{GREEN}→ Opening session {BOLD}{cid}{RESET}{title_str} (workspace {ws}, {cwd})...")
+        spawn_terminal_with_agy(conv_id=cid, cwd=cwd, title=title, workspace=ws, skip_perms=True)
+        launched += 1
+        time.sleep(0.35)
+
+    if is_hyprland_active() and workspaces_used:
+        first_ws = workspaces_used[0]
+        subprocess.run(
+            ["hyprctl", "dispatch", f'hl.dsp.focus({{ workspace = "{first_ws}" }})'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+    print(f"\n{BOLD}Done:{RESET} {GREEN}{launched}{RESET} session(s) launched, {YELLOW}{skipped}{RESET} already running.")
+    return 0
+
+
+# =====================================================================
+# OVERVIEW / INTERACTIVE LIST COMMAND
+# =====================================================================
+
+def cmd_list(interactive: bool = True, limit_recent: int = 10) -> int:
+    """Display active, saved, and recent agy sessions with optional interactive picker."""
+    gemini_root = get_gemini_root()
+    meta = load_metadata(gemini_root)
+    active = scan_active_agy_sessions(meta)
+    active_ids = {r["conversation_id"] for r in active}
+    saved = load_saved_sessions(meta)
+    saved_ids = {r["conversation_id"] for r in saved}
+
+    selectable: list[dict] = []
+
+    print(f"\n{BOLD}=== Active Running Sessions ({len(active)}) ==={RESET}")
+    if active:
+        for r in active:
+            selectable.append(r)
+            idx = len(selectable)
+            cid = r["conversation_id"]
+            title = r["title"] or "(Untitled session)"
+            cwd = r["cwd"].replace(str(Path.home()), "~")
+            ws = r.get("ws") or "1"
+            print(
+                f"  {BOLD}{YELLOW}[{idx:2d}]{RESET} {GREEN}● LIVE{RESET} "
+                f"{DIM}(WS {ws} · PID {r['pid']}){RESET}  {BOLD}{CYAN}{cid}{RESET}\n"
+                f"       {BOLD}{title}{RESET} {DIM}({cwd}){RESET}"
+            )
+    else:
+        print(f"  {DIM}No agy sessions currently running.{RESET}")
+
+    print(f"\n{BOLD}=== Saved Snapshot Sessions ({len(saved)}) ==={RESET}")
+    if saved:
+        for s in saved:
+            cid = s["conversation_id"]
+            status_badge = f"{GREEN}● RUNNING{RESET}" if cid in active_ids else f"{YELLOW}○ SAVED{RESET}  "
+            selectable.append(s)
+            idx = len(selectable)
+            title = s["title"] or "(Untitled session)"
+            cwd = s["cwd"].replace(str(Path.home()), "~")
+            ws = s.get("ws") or "1"
+            print(
+                f"  {BOLD}{YELLOW}[{idx:2d}]{RESET} {status_badge} "
+                f"{DIM}(WS {ws}){RESET}  {BOLD}{CYAN}{cid}{RESET}\n"
+                f"       {BOLD}{title}{RESET} {DIM}({cwd}){RESET}"
+            )
+    else:
+        print(f"  {DIM}No saved snapshot in {get_config_file()}.{RESET}")
+
+    # Recent sessions from metadata not already listed above
+    recent_candidates = [
+        (cid, info)
+        for cid, info in meta.items()
+        if not info.get("parent_id") and cid not in active_ids and cid not in saved_ids
+    ]
+    recent_candidates.sort(key=lambda x: x[1].get("timestamp", 0.0), reverse=True)
+    recent = recent_candidates[:limit_recent]
+
+    if recent:
+        print(f"\n{BOLD}=== Recent Conversations (Top {len(recent)}) ==={RESET}")
+        for cid, info in recent:
+            item = {
+                "conversation_id": cid,
+                "cwd": info.get("cwd") or str(Path.home()),
+                "title": info.get("title") or "(Untitled session)",
+                "date_str": info.get("date_str") or "",
+            }
+            selectable.append(item)
+            idx = len(selectable)
+            cwd = item["cwd"].replace(str(Path.home()), "~")
+            print(
+                f"  {BOLD}{YELLOW}[{idx:2d}]{RESET} {DIM}{item['date_str']}{RESET}  {BOLD}{CYAN}{cid}{RESET}\n"
+                f"       {BOLD}{item['title']}{RESET} {DIM}({cwd}){RESET}"
+            )
+
+    print()
+    if not interactive or not sys.stdin.isatty() or not selectable:
+        return 0
+
+    return prompt_reopen_selection(selectable)
+
+
+# =====================================================================
+# FULL-TEXT SEARCH COMMAND
+# =====================================================================
+
+def extract_snippet(text: str, pattern: re.Pattern, width: int = 110) -> str:
+    """Create a single-line snippet centred around the first pattern match with highlighting."""
+    single_line = " ".join(text.split())
+    m = pattern.search(single_line)
+    if not m:
+        snippet = single_line[:width]
+        return snippet + ("…" if len(single_line) > width else "")
+
+    start, end = m.span()
+    half = max(20, (width - (end - start)) // 2)
+    left = max(0, start - half)
+    right = min(len(single_line), end + half)
+    prefix = "…" if left > 0 else ""
+    suffix = "…" if right < len(single_line) else ""
+    chunk = single_line[left:right]
+
+    highlighted = pattern.sub(lambda match: f"{BG_YELLOW}{match.group(0)}{RESET}", chunk)
+    return f"{prefix}{highlighted}{suffix}"
+
+
+def ensure_session_info(cid: str, brain_dir: Path, meta: dict[str, dict]) -> dict:
+    """Ensure a session has Created date, Last Updated date, and Title."""
+    info = meta.setdefault(
+        cid,
+        {
+            "title": "",
+            "preview": "",
+            "created_str": "",
+            "date_str": "",
+            "timestamp": 0.0,
+            "cwd": str(Path.home()),
+            "parent_id": "",
+        },
+    )
+    info.setdefault("created_str", "")
+    conv_dir = brain_dir / cid
+    transcript = conv_dir / ".system_generated" / "logs" / "transcript.jsonl"
+
+    if conv_dir.exists():
+        try:
+            target = transcript if transcript.exists() else conv_dir
+            mtime = target.stat().st_mtime
+            if mtime > info["timestamp"]:
+                dt = datetime.datetime.fromtimestamp(mtime).astimezone()
+                info["timestamp"] = mtime
+                info["date_str"] = dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+
+    if (not info["created_str"] or not info["title"]) and transcript.exists():
+        try:
+            with open(transcript, "r", encoding="utf-8", errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i > 15 and info["created_str"] and info["title"]:
+                        break
+                    if i == 0 and not info["created_str"]:
+                        try:
+                            first_obj = json.loads(line)
+                            c_str, _ = parse_iso_timestamp(first_obj.get("created_at", ""))
+                            if c_str:
+                                info["created_str"] = c_str
+                        except Exception:
+                            pass
+                    if not info["title"] and '"USER_INPUT"' in line:
+                        obj = json.loads(line)
+                        if obj.get("type") == "USER_INPUT":
+                            if not info["created_str"]:
+                                c_str, _ = parse_iso_timestamp(obj.get("created_at", ""))
+                                if c_str:
+                                    info["created_str"] = c_str
+                            prompt = clean_user_content(obj.get("content", ""))
+                            if prompt:
+                                first_line = " ".join(prompt.split())
+                                info["title"] = first_line[:65] + ("…" if len(first_line) > 65 else "")
+                                if info["created_str"]:
+                                    break
+                    elif i > 15:
+                        break
+        except Exception:
+            pass
+
+    if not info["created_str"] and conv_dir.exists():
+        try:
+            st = conv_dir.stat()
+            btime = getattr(st, "st_birthtime", st.st_ctime)
+            info["created_str"] = datetime.datetime.fromtimestamp(btime).astimezone().strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            info["created_str"] = info["date_str"]
+
+    return info
+
+
+def search_gemini_folders(
+    query: str,
+    gemini_root: Path,
+    user_only: bool = False,
+    case_sensitive: bool = False,
+    include_subagents: bool = False,
+    max_snippets: int = 3,
+) -> list[dict]:
+    """Search across all brain folders and metadata for query."""
+    flags = 0 if case_sensitive else re.IGNORECASE
+    try:
+        pattern = re.compile(query, flags)
+    except re.error:
+        pattern = re.compile(re.escape(query), flags)
+
+    meta = load_metadata(gemini_root)
+    results: dict[str, dict] = {}
+
+    def is_subagent_session(cid: str, brain_dir: Path) -> bool:
+        info = meta.get(cid)
+        if info and info.get("parent_id"):
+            return True
+        transcript = brain_dir / cid / ".system_generated" / "logs" / "transcript.jsonl"
+        if transcript.exists():
+            try:
+                with open(transcript, "r", encoding="utf-8", errors="replace") as f:
+                    first_line = f.readline()
+                    if '"source":"SUBAGENT"' in first_line or '"SUBAGENT"' in first_line:
+                        return True
+            except Exception:
+                pass
+        return False
+
+    def add_match(cid: str, brain_dir: Path, source_label: str, snippet: str, step_ts: float = 0.0, step_dt: str = ""):
+        info = ensure_session_info(cid, brain_dir, meta)
+        if not include_subagents and (info["parent_id"] or is_subagent_session(cid, brain_dir)):
+            return
+        entry = results.setdefault(
+            cid,
+            {
+                "conversation_id": cid,
+                "title": info["title"] or "(Untitled session)",
+                "created_str": info["created_str"] or info["date_str"] or step_dt or "Unknown date",
+                "date_str": info["date_str"] or step_dt or "Unknown date",
+                "timestamp": max(info["timestamp"], step_ts),
+                "cwd": info["cwd"],
+                "parent_id": info["parent_id"],
+                "match_count": 0,
+                "snippets": [],
+            },
+        )
+        if step_ts > entry["timestamp"]:
+            entry["timestamp"] = step_ts
+            if step_dt:
+                entry["date_str"] = step_dt
+        entry["match_count"] += 1
+        if len(entry["snippets"]) < max_snippets:
+            formatted = f"[{source_label}] {snippet}"
+            if formatted not in entry["snippets"]:
+                entry["snippets"].append(formatted)
+
+    default_brain = gemini_root / "antigravity-cli" / "brain"
+
+    for cid, info in list(meta.items()):
+        if info["title"] and pattern.search(info["title"]):
+            add_match(cid, default_brain, "TITLE", extract_snippet(info["title"], pattern))
+        elif info["preview"] and pattern.search(info["preview"]):
+            add_match(cid, default_brain, "PREVIEW", extract_snippet(info["preview"], pattern))
+
+    brain_dirs = [p for p in gemini_root.glob("*/brain") if p.is_dir()]
+    rg_bin = shutil.which("rg")
+
+    matching_files: list[Path] = []
+    if rg_bin and brain_dirs:
+        cmd = [
+            rg_bin,
+            "-l",
+            "--hidden",
+            "--no-ignore",
+            "-g",
+            "**/transcript.jsonl",
+            "-g",
+            "*.md",
+            "-g",
+            "*.txt",
+            "-g",
+            "*.py",
+            "-g",
+            "*.sh",
+            "-g",
+            "!**/.system_generated/steps/**",
+            "-g",
+            "!**/.system_generated/logs/chunks/**",
+            "-g",
+            "!**/.system_generated/tasks/**",
+            "-g",
+            "!**/.system_generated/subagents/**",
+            "-g",
+            "!**/transcript_full.jsonl",
+            "-g",
+            "!*.resolved*",
+        ]
+        if not case_sensitive:
+            cmd.append("-i")
+        cmd.extend(["--", query])
+        cmd.extend([str(b) for b in brain_dirs])
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            for line in proc.stdout.splitlines():
+                matching_files.append(Path(line.strip()))
+        except Exception:
+            pass
+    else:
+        for b in brain_dirs:
+            for p in b.rglob("*"):
+                if p.is_file() and p.name == "transcript.jsonl":
+                    matching_files.append(p)
+
+    matching_files.sort(key=lambda p: (0 if p.name == "transcript.jsonl" else 1, p.name))
+
+    for fpath in matching_files:
+        m_uuid = UUID_RE.search(str(fpath))
+        if not m_uuid:
+            continue
+        cid = m_uuid.group(1).lower()
+
+        brain_dir = default_brain
+        for b in brain_dirs:
+            if str(fpath).startswith(str(b)):
+                brain_dir = b
+                break
+
+        if fpath.name == "transcript.jsonl":
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if not pattern.search(line):
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+
+                        step_type = obj.get("type", "STEP")
+                        if user_only and step_type != "USER_INPUT":
+                            continue
+
+                        created_at = obj.get("created_at", "")
+                        step_dt, step_ts = parse_iso_timestamp(created_at)
+
+                        content = obj.get("content", "") or ""
+                        thinking = obj.get("thinking", "") or ""
+
+                        if step_type == "USER_INPUT":
+                            content = clean_user_content(content)
+                            if pattern.search(content):
+                                add_match(
+                                    cid,
+                                    brain_dir,
+                                    f"{GREEN}USER{RESET}",
+                                    extract_snippet(content, pattern),
+                                    step_ts,
+                                    step_dt,
+                                )
+                        elif step_type == "PLANNER_RESPONSE":
+                            if content and pattern.search(content):
+                                add_match(
+                                    cid,
+                                    brain_dir,
+                                    f"{CYAN}AGENT{RESET}",
+                                    extract_snippet(content, pattern),
+                                    step_ts,
+                                    step_dt,
+                                )
+                            elif thinking and pattern.search(thinking):
+                                add_match(
+                                    cid,
+                                    brain_dir,
+                                    f"{DIM}THINKING{RESET}",
+                                    extract_snippet(thinking, pattern),
+                                    step_ts,
+                                    step_dt,
+                                )
+                            else:
+                                tc_str = json.dumps(obj.get("tool_calls", []))
+                                if pattern.search(tc_str):
+                                    add_match(
+                                        cid,
+                                        brain_dir,
+                                        f"{MAGENTA}TOOL_CALL{RESET}",
+                                        extract_snippet(tc_str, pattern),
+                                    step_ts,
+                                        step_dt,
+                                    )
+                        else:
+                            if content and pattern.search(content):
+                                add_match(
+                                    cid,
+                                    brain_dir,
+                                    f"{DIM}{step_type}{RESET}",
+                                    extract_snippet(content, pattern),
+                                    step_ts,
+                                    step_dt,
+                                )
+            except Exception:
+                pass
+        else:
+            if user_only:
+                continue
+            label = f"{YELLOW}ARTEFACT:{fpath.name}{RESET}"
+            try:
+                text = fpath.read_text(encoding="utf-8", errors="replace")
+                if pattern.search(text):
+                    mtime = fpath.stat().st_mtime
+                    dt_str = datetime.datetime.fromtimestamp(mtime).astimezone().strftime("%Y-%m-%d %H:%M")
+                    add_match(cid, brain_dir, label, extract_snippet(text, pattern), mtime, dt_str)
+            except Exception:
+                pass
+
+    return sorted(results.values(), key=lambda r: r["timestamp"], reverse=True)
+
+
+def prompt_reopen_selection(displayed: list[dict], default_new_window: bool = False) -> int:
+    """Interactive prompt to reopen a session inline or in a new terminal window."""
+    while True:
+        try:
+            choice = input(
+                f"{BOLD}Reopen session:{RESET} Enter {YELLOW}1-{len(displayed)}{RESET} to open here, "
+                f"{YELLOW}w <num>{RESET} for new terminal window, or {YELLOW}Enter/q{RESET} to quit: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+
+        if not choice or choice.lower() in ("q", "quit", "exit"):
+            return 0
+
+        open_in_window = default_new_window
+        if choice.lower().startswith(("w ", "n ")):
+            open_in_window = True
+            choice = choice[2:].strip()
+        elif choice.lower().startswith(("w", "n")) and choice[1:].isdigit():
+            open_in_window = True
+            choice = choice[1:]
+
+        if choice.isdigit():
+            sel_idx = int(choice)
+            if 1 <= sel_idx <= len(displayed):
+                selected = displayed[sel_idx - 1]
+                launch_agy_session(
+                    conv_id=selected["conversation_id"],
+                    cwd=selected.get("cwd") or str(Path.home()),
+                    title=selected.get("title") or "",
+                    new_window=open_in_window,
+                )
+                return 0
+        print(f"{RED}Invalid selection.{RESET} Please enter a number between 1 and {len(displayed)}, or 'q' to quit.")
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    query = " ".join(args.query).strip()
+    if not query:
+        try:
+            query = input(f"{BOLD}Enter search string for Gemini/Antigravity sessions:{RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not query:
+            return 0
+
+    gemini_root = get_gemini_root()
+    if not gemini_root.exists():
+        print(f"{RED}Error:{RESET} {gemini_root} does not exist.", file=sys.stderr)
+        return 1
+
+    results = search_gemini_folders(
+        query=query,
+        gemini_root=gemini_root,
+        user_only=args.user_only,
+        case_sensitive=args.case_sensitive,
+        include_subagents=args.all,
+    )
+
+    if not results:
+        print(f"{YELLOW}No conversations found matching:{RESET} {BOLD}{query}{RESET}")
+        return 0
+
+    displayed = results[: args.limit]
+    total_conv = len(results)
+
+    print(
+        f"\n{BOLD}Found {GREEN}{total_conv}{RESET}{BOLD} conversation(s) matching '{YELLOW}{query}{RESET}{BOLD}' "
+        + (
+            f"(ordered by most recently updated, top {len(displayed)}):"
+            if total_conv > len(displayed)
+            else "(ordered by most recently updated):"
+        )
+        + f"{RESET}\n"
+    )
+
+    for idx, item in enumerate(displayed, start=1):
+        cid = item["conversation_id"]
+        created_str = item.get("created_str") or item["date_str"]
+        updated_str = item["date_str"]
+        title = item["title"]
+        count = item["match_count"]
+        cwd = item["cwd"].replace(str(Path.home()), "~")
+        subagent_tag = f" {DIM}(subagent){RESET}" if item["parent_id"] else ""
+
+        print(
+            f"{BOLD}{YELLOW}[{idx:2d}]{RESET} "
+            f"{DIM}Updated:{RESET} {BOLD}{GREEN}{updated_str}{RESET}  "
+            f"{DIM}Created:{RESET} {GREEN}{created_str}{RESET}  "
+            f"{BOLD}{CYAN}{cid}{RESET}\n"
+            f"     {BOLD}{title}{RESET}{subagent_tag} "
+            f"{DIM}({count} match{'es' if count != 1 else ''} · {cwd}){RESET}"
+        )
+        for snip in item["snippets"]:
+            print(f"      {snip}")
+        print()
+
+    if args.no_prompt or not sys.stdin.isatty():
+        return 0
+
+    return prompt_reopen_selection(displayed, default_new_window=args.new_window)
+
+
+# =====================================================================
+# AUTO-SAVE SYSTEMD TIMER MANAGEMENT
+# =====================================================================
+
+def cmd_auto_save(action: str) -> int:
+    systemd_dir = Path.home() / ".config" / "systemd" / "user"
+    systemd_dir.mkdir(parents=True, exist_ok=True)
+    service_file = systemd_dir / "agy-snapshot.service"
+    timer_file = systemd_dir / "agy-snapshot.timer"
+    bin_path = Path.home() / ".local" / "bin" / "agycmdr"
+    if not bin_path.exists():
+        bin_path = Path(sys.argv[0]).resolve()
+
+    if action == "enable":
+        service_file.write_text(
+            "[Unit]\n"
+            "Description=Snapshot active Antigravity CLI (agy) conversations\n\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            f"ExecStart={bin_path} save\n",
+            encoding="utf-8",
+        )
+        timer_file.write_text(
+            "[Unit]\n"
+            "Description=Periodically snapshot active agy sessions\n\n"
+            "[Timer]\n"
+            "OnBootSec=1min\n"
+            "OnUnitActiveSec=2min\n"
+            "Persistent=true\n\n"
+            "[Install]\n"
+            "WantedBy=timers.target\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        subprocess.run(["systemctl", "--user", "enable", "--now", "agy-snapshot.timer"], check=False)
+        print(f"{GREEN}Enabled and started agy-snapshot.timer (saves active sessions every 2 minutes).{RESET}")
+        return 0
+    elif action == "disable":
+        subprocess.run(["systemctl", "--user", "disable", "--now", "agy-snapshot.timer"], check=False)
+        print(f"{YELLOW}Disabled agy-snapshot.timer.{RESET}")
+        return 0
+    else:
+        res = subprocess.run(
+            ["systemctl", "--user", "is-active", "agy-snapshot.timer"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        state = res.stdout.strip() or "inactive"
+        colour = GREEN if state == "active" else YELLOW
+        print(f"Auto-save timer (agy-snapshot.timer): {BOLD}{colour}{state}{RESET}")
+        return 0
+
+
+# =====================================================================
+# ENTRYPOINT & BACKWARD-COMPATIBLE SYMLINK DISPATCH
+# =====================================================================
+
+def build_search_parser(prog: str = "agy-search") -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Search ~/.gemini folders for a string, show dated Conversation IDs, and optionally reopen in agy.",
+    )
+    parser.add_argument("query", nargs="*", help="Search string or regular expression")
+    parser.add_argument(
+        "-u", "--user-only", action="store_true", help="Only search user prompts (USER_INPUT) and conversation titles"
+    )
+    parser.add_argument("-s", "--case-sensitive", action="store_true", help="Perform a case-sensitive search")
+    parser.add_argument(
+        "-l", "--limit", type=int, default=25, help="Maximum number of conversations to display (default: 25)"
+    )
+    parser.add_argument("-n", "--no-prompt", action="store_true", help="Print results and exit without prompting")
+    parser.add_argument("-a", "--all", action="store_true", help="Include internal subagent sessions in results")
+    parser.add_argument(
+        "-w", "--new-window", action="store_true", help="Open selected conversation in a new terminal window by default"
+    )
+    return parser
+
+
+def main() -> int:
+    invoked_as = os.path.basename(sys.argv[0])
+
+    # 1. Backward compatibility when called as `agy-search`
+    if invoked_as == "agy-search":
+        parser = build_search_parser("agy-search")
+        return cmd_search(parser.parse_args())
+
+    # 2. Backward compatibility when called as `agy-restore` or `restore-agy-workspaces`
+    if invoked_as in ("agy-restore", "restore-agy-workspaces"):
+        arg1 = sys.argv[1] if len(sys.argv) > 1 else ""
+        if arg1 in ("--save", "--snapshot", "-s", "save"):
+            return cmd_save()
+        if arg1 in ("--list", "-l", "list"):
+            return cmd_list(interactive=False)
+        if arg1 in ("--help", "-h", "help"):
+            print(f"Usage: {invoked_as} [--save | --list | --help]")
+            print("  (no args)  Launch saved agy sessions into their workspaces/windows")
+            print("  --save     Snapshot all currently running agy sessions into ~/.config/agy/workspaces.json")
+            print("  --list     List active, saved, and recent sessions")
+            return 0
+        return cmd_restore()
+
+    # 3. Unified CLI (`agycmdr`)
+    if len(sys.argv) == 1:
+        return cmd_list(interactive=True)
+
+    subcmd = sys.argv[1]
+    rest = sys.argv[2:]
+
+    if subcmd in ("list", "ls", "status"):
+        no_prompt = "-n" in rest or "--no-prompt" in rest
+        return cmd_list(interactive=not no_prompt)
+    if subcmd in ("save", "snapshot", "--save", "-s"):
+        return cmd_save()
+    if subcmd in ("restore", "--restore", "-r"):
+        return cmd_restore()
+    if subcmd in ("search", "find", "/"):
+        parser = build_search_parser("agycmdr search")
+        return cmd_search(parser.parse_args(rest))
+    if subcmd == "auto-save":
+        if "--enable" in rest or "enable" in rest:
+            return cmd_auto_save("enable")
+        if "--disable" in rest or "disable" in rest:
+            return cmd_auto_save("disable")
+        return cmd_auto_save("status")
+    if subcmd in ("-h", "--help", "help"):
+        print(
+            f"{BOLD}agycmdr v{VERSION}{RESET} — Antigravity Commander: Unified session manager & search for Google Antigravity CLI (agy)\n\n"
+            f"{BOLD}Usage:{RESET}\n"
+            f"  {CYAN}agycmdr{RESET}                      Interactive dashboard of live, saved & recent sessions\n"
+            f"  {CYAN}agycmdr search <query>{RESET}       Full-text search across all transcripts & artifacts (alias: {YELLOW}agy-search{RESET})\n"
+            f"  {CYAN}agycmdr save{RESET}                 Snapshot currently running agy sessions (alias: {YELLOW}agy-restore --save{RESET})\n"
+            f"  {CYAN}agycmdr restore{RESET}              Reopen all saved agy sessions (alias: {YELLOW}agy-restore{RESET})\n"
+            f"  {CYAN}agycmdr list [-n]{RESET}            List active, saved, and recent sessions\n"
+            f"  {CYAN}agycmdr auto-save{RESET}            Check or toggle systemd timer ({YELLOW}--enable{RESET} | {YELLOW}--disable{RESET})\n"
+        )
+        return 0
+
+    # If user typed `agycmdr <search-term>` directly without 'search' subcommand, treat as search!
+    parser = build_search_parser("agycmdr")
+    return cmd_search(parser.parse_args(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
